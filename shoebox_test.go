@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adexaja/shoebox/internal/broker"
+	"github.com/adexaja/shoebox/internal/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -358,4 +360,70 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %v", timeout)
+}
+
+// failingAckStore makes AckBatch fail while armed, so the public Drain and
+// Shutdown error contract can be exercised end to end.
+type failingAckStore struct {
+	storage.Storage
+	mu   sync.Mutex
+	fail bool
+}
+
+func (s *failingAckStore) AckBatch(ctx context.Context, queue string, ids []string) error {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return errors.New("ack batch failed")
+	}
+	return s.Storage.AckBatch(ctx, queue, ids)
+}
+
+func (s *failingAckStore) setFail(v bool) {
+	s.mu.Lock()
+	s.fail = v
+	s.mu.Unlock()
+}
+
+// TestDrainExposesUnsettledAckError verifies the public Drain returns an error
+// matching ErrUnsettledAcks when a confirmation cannot be written, and matches
+// the context cause too when the wait is cancelled.
+func TestDrainExposesUnsettledAckError(t *testing.T) {
+	store := &failingAckStore{Storage: storage.NewMemory(), fail: true}
+	q := &Queue{b: broker.New(broker.Options{
+		Storage:          store,
+		Concurrency:      1,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AckBatchSize:     1,
+		AckFlushInterval: time.Hour, // Drain drives the flush
+	})}
+
+	q.Handle("q", func(context.Context, Message) error { return nil })
+	if err := q.Enqueue("q", []byte("a")); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	waitFor(t, func() bool {
+		s, _ := q.Stats(context.Background(), "q")
+		return s.PendingAcks == 1
+	}, 2*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err := q.Drain(ctx, "q")
+	if !errors.Is(err, ErrUnsettledAcks) {
+		t.Fatalf("Drain err = %v, want ErrUnsettledAcks", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain err = %v, want context.DeadlineExceeded", err)
+	}
+
+	// Recover and confirm a fresh Drain succeeds.
+	store.setFail(false)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if err := q.Drain(ctx2, "q"); err != nil {
+		t.Fatalf("Drain after recovery: %v", err)
+	}
+	_ = q.Shutdown(context.Background())
 }

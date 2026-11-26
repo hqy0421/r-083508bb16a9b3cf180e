@@ -112,6 +112,15 @@ type QueueStats struct {
 	Errors    uint64
 	Retries   uint64
 	Dead      uint64
+
+	// PendingAcks is the number of successful acknowledgements the broker is
+	// still holding in its confirmation buffer, not yet durably written. The
+	// storage backends leave it zero; the broker overlays it when
+	// acknowledgement batching is enabled. A non-zero value means Depth and the
+	// other counters may lag the true on-disk state until the next successful
+	// write; once that write commits, this count and the stored outcome update
+	// together.
+	PendingAcks int
 }
 
 // ErrEmpty is returned by Dequeue when no messages are available.

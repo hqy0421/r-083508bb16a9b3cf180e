@@ -7,7 +7,19 @@ and releases follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `shoebox.ErrUnsettledAcks`, surfaced by `Drain` and `Shutdown` when buffered
+  acknowledgements cannot be durably confirmed.
+- `QueueStats.PendingAcks` reports buffered acknowledgements not yet committed.
+
 ### Fixed
+
+- Failed acknowledgement batches are retained and retried per queue instead of
+  dropping acknowledgements added during an in-flight write; settled IDs are
+  resent idempotently without touching other messages.
+- `Drain` and `Shutdown` no longer report success while a queue still has
+  unsettled acknowledgements; other queues' settled results return independently.
 
 - Fixed PostgreSQL upgrades from the v0.1.6 schema and repaired databases
   whose v0.1.7 migration marker skipped the schedule and durable-dedupe

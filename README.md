@@ -196,8 +196,18 @@ q, err := shoebox.New(shoebox.Options{
 
 The defaults are 50 acknowledgements and 10ms when batching is enabled.
 Pending acknowledgements remain in memory until flushed, so a crash can cause
-redelivery but cannot lose an unacknowledged message. `Drain` and `Shutdown`
-flush pending acknowledgements before completing.
+redelivery but cannot lose an unacknowledged message.
+
+If a confirmation write fails (for example a transient SQLite error), the
+broker keeps that batch's unsettled acknowledgements and retries them
+independently per queue; already-settled acknowledgements are resent
+idempotently without affecting other messages. `QueueStats.PendingAcks`
+reports how many acks are still buffered, and the stored counters update only
+once the next write commits. `Drain` and `Shutdown` never report success while
+unsettled acknowledgements remain for the queue: they return an error wrapping
+`shoebox.ErrUnsettledAcks` (joined with the context error when a wait is
+cancelled), so callers can detect and retry after the store recovers. Queues
+with no unsettled acks settle independently and return normally.
 
 ## Storage
 

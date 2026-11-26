@@ -6,6 +6,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,27 @@ import (
 	"github.com/adexaja/shoebox/internal/retry"
 	"github.com/adexaja/shoebox/internal/storage"
 )
+
+// ackFinalFlushTimeout bounds the best-effort acknowledgement flush performed
+// after Shutdown force-aborts. It keeps that final flush from relying on an
+// already-expired caller context.
+const ackFinalFlushTimeout = 5 * time.Second
+
+// ErrUnsettledAcks reports that one or more successful handler outcomes could
+// not yet be durably confirmed. The broker retains those acknowledgements and
+// retries them independently per queue; Drain and Shutdown surface this error
+// rather than claiming success while they remain unwritten.
+var ErrUnsettledAcks = errors.New("shoebox: unsettled acknowledgements")
+
+// ackState is the per-queue acknowledgement buffer. pending holds message IDs
+// whose handlers succeeded but whose durable confirmation has not yet
+// committed. flushMu serializes store calls for the queue so a snapshot is
+// trimmed only after its exact batch succeeds.
+type ackState struct {
+	mu      sync.Mutex
+	flushMu sync.Mutex
+	pending []string
+}
 
 // Options configures the internal broker and optional acknowledgement batching.
 type Options struct {
@@ -64,7 +86,7 @@ type Broker struct {
 	wg        sync.WaitGroup // counts dispatchers + workers; Shutdown waits on this
 
 	ackMu            sync.Mutex
-	pendingAcks      map[string][]string
+	ackQueues        map[string]*ackState
 	ackBatchSize     int
 	ackFlushInterval time.Duration
 	ackStop          chan struct{}
@@ -142,7 +164,7 @@ func New(opts Options) *Broker {
 		ackFlushInterval: opts.AckFlushInterval,
 	}
 	if b.ackBatchSize > 0 && b.ackFlushInterval > 0 {
-		b.pendingAcks = make(map[string][]string)
+		b.ackQueues = make(map[string]*ackState)
 		b.ackStop = make(chan struct{})
 		b.ackWG.Add(1)
 		go b.ackLoop()
@@ -453,9 +475,14 @@ func (b *Broker) drainComplete(queue string) bool {
 	if !b.quiescent(queue) {
 		return false
 	}
-	if err := b.flushAcks(queue); err != nil {
+	if err := b.flushAcks(b.storeCtx(), queue); err != nil {
 		b.logger.ErrorContext(b.storeCtx(), "shoebox: drain ack flush failed",
 			slog.String("queue", queue), slog.Any("err", err))
+		return false
+	}
+	// A queue is not drained while acks remain uncommitted. The ack loop and
+	// dispatcher poll retry them, so this stays false until they settle.
+	if b.pendingAckCount(queue) > 0 {
 		return false
 	}
 
@@ -565,14 +592,75 @@ func (b *Broker) ack(queue, msgID string) error {
 		return b.store.Ack(b.storeCtx(), queue, msgID)
 	}
 
-	b.ackMu.Lock()
-	b.pendingAcks[queue] = append(b.pendingAcks[queue], msgID)
-	flush := len(b.pendingAcks[queue]) >= b.ackBatchSize
-	b.ackMu.Unlock()
-	if flush {
-		return b.flushAcks(queue)
+	st := b.ackStateFor(queue)
+	st.mu.Lock()
+	st.pending = append(st.pending, msgID)
+	flush := len(st.pending) >= b.ackBatchSize
+	st.mu.Unlock()
+	if !flush {
+		return nil
+	}
+	if err := b.flushAcks(b.storeCtx(), queue); err != nil {
+		// Nudge the dispatcher so a failed batch is retried promptly rather
+		// than waiting for the periodic poll.
+		b.wake(queue)
+		return err
 	}
 	return nil
+}
+
+// ackStateFor returns the per-queue acknowledgement buffer, creating it on
+// demand. The map lookup/insertion is guarded by ackMu; the returned state's
+// own locks guard its fields.
+func (b *Broker) ackStateFor(queue string) *ackState {
+	b.ackMu.Lock()
+	defer b.ackMu.Unlock()
+	if b.ackQueues == nil {
+		b.ackQueues = make(map[string]*ackState)
+	}
+	st, ok := b.ackQueues[queue]
+	if !ok {
+		st = &ackState{}
+		b.ackQueues[queue] = st
+	}
+	return st
+}
+
+// pendingAckCount returns the number of buffered-but-uncommitted acks for a
+// queue. When batching is disabled there is nothing buffered, so it returns 0.
+func (b *Broker) pendingAckCount(queue string) int {
+	if b.ackBatchSize <= 0 || b.ackStop == nil {
+		return 0
+	}
+	b.ackMu.Lock()
+	st, ok := b.ackQueues[queue]
+	b.ackMu.Unlock()
+	if !ok {
+		return 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return len(st.pending)
+}
+
+// totalPendingAcks sums the uncommitted ack counts across all queues.
+func (b *Broker) totalPendingAcks() int {
+	if b.ackBatchSize <= 0 || b.ackStop == nil {
+		return 0
+	}
+	b.ackMu.Lock()
+	states := make([]*ackState, 0, len(b.ackQueues))
+	for _, st := range b.ackQueues {
+		states = append(states, st)
+	}
+	b.ackMu.Unlock()
+	total := 0
+	for _, st := range states {
+		st.mu.Lock()
+		total += len(st.pending)
+		st.mu.Unlock()
+	}
+	return total
 }
 
 func (b *Broker) ackLoop() {
@@ -582,7 +670,7 @@ func (b *Broker) ackLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := b.flushAllAcks(); err != nil {
+			if err := b.flushAllAcks(b.storeCtx()); err != nil {
 				b.logger.ErrorContext(b.storeCtx(), "shoebox: ack batch flush failed",
 					slog.Any("err", err))
 			}
@@ -592,39 +680,61 @@ func (b *Broker) ackLoop() {
 	}
 }
 
-func (b *Broker) flushAcks(queue string) error {
+// flushAcks attempts to durably commit the queue's buffered acknowledgements.
+// On success it removes exactly the committed snapshot, so acks appended while
+// the store call was running remain unsettled; on failure it leaves the whole
+// buffer intact for the next attempt. Resending already-committed IDs is safe
+// because every backend deletes only rows still in the processing state and
+// counts only those actually removed.
+func (b *Broker) flushAcks(ctx context.Context, queue string) error {
 	b.ackMu.Lock()
-	ids := b.pendingAcks[queue]
-	delete(b.pendingAcks, queue)
+	st, ok := b.ackQueues[queue]
 	b.ackMu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	st.flushMu.Lock()
+	defer st.flushMu.Unlock()
+
+	st.mu.Lock()
+	ids := append([]string(nil), st.pending...)
+	st.mu.Unlock()
 	if len(ids) == 0 {
 		return nil
 	}
 
-	if err := b.store.AckBatch(b.storeCtx(), queue, ids); err != nil {
-		b.ackMu.Lock()
-		b.pendingAcks[queue] = append(ids, b.pendingAcks[queue]...)
-		b.ackMu.Unlock()
-		return err
+	if err := b.store.AckBatch(ctx, queue, ids); err != nil {
+		return fmt.Errorf("shoebox: ack flush %q: %w", queue, err)
 	}
+
+	st.mu.Lock()
+	st.pending = append([]string(nil), st.pending[len(ids):]...)
+	st.mu.Unlock()
 	return nil
 }
 
-func (b *Broker) flushAllAcks() error {
+// flushAllAcks flushes every queue's buffer independently. A failure in one
+// queue does not prevent the others from settling; the errors are joined so
+// callers can inspect each cause.
+func (b *Broker) flushAllAcks(ctx context.Context) error {
+	if b.ackBatchSize <= 0 || b.ackStop == nil {
+		return nil
+	}
 	b.ackMu.Lock()
-	queues := make([]string, 0, len(b.pendingAcks))
-	for queue := range b.pendingAcks {
+	queues := make([]string, 0, len(b.ackQueues))
+	for queue := range b.ackQueues {
 		queues = append(queues, queue)
 	}
 	b.ackMu.Unlock()
 
-	var firstErr error
+	var errs []error
 	for _, queue := range queues {
-		if err := b.flushAcks(queue); err != nil && firstErr == nil {
-			firstErr = err
+		if err := b.flushAcks(ctx, queue); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return firstErr
+	return errors.Join(errs...)
 }
 
 func (b *Broker) stopAckLoop() {
@@ -697,7 +807,10 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 	select {
 	case <-done:
 		b.stopAckLoop()
-		err := b.flushAllAcks()
+		err := b.flushAllAcks(b.storeCtx())
+		if err != nil {
+			err = errors.Join(ErrUnsettledAcks, err)
+		}
 		b.closeOnce.Do(func() { _ = b.store.Close() })
 		return err
 	case <-ctx.Done():
@@ -711,9 +824,17 @@ func (b *Broker) Shutdown(ctx context.Context) error {
 		go func() {
 			<-done
 			b.stopAckLoop()
-			_ = b.flushAllAcks()
+			// The caller's ctx is cancelled at this point, so the final
+			// best-effort flush must not be born cancelled.
+			flushCtx, flushCancel := context.WithTimeout(
+				context.WithoutCancel(ctx), ackFinalFlushTimeout)
+			defer flushCancel()
+			_ = b.flushAllAcks(flushCtx)
 			b.closeOnce.Do(func() { _ = b.store.Close() })
 		}()
+		if b.totalPendingAcks() > 0 {
+			return errors.Join(ctx.Err(), ErrUnsettledAcks)
+		}
 		return ctx.Err()
 	}
 }
@@ -749,9 +870,16 @@ func (b *Broker) Queues() []string {
 	return out
 }
 
-// Stats returns a snapshot of queue stats.
+// Stats returns a snapshot of queue stats. When acknowledgement batching is
+// enabled, PendingAcks reports the buffered-but-uncommitted acks so callers can
+// see how far the stored counters lag the true state.
 func (b *Broker) Stats(ctx context.Context, queue string) (storage.QueueStats, error) {
-	return b.store.Stats(ctx, queue)
+	stats, err := b.store.Stats(ctx, queue)
+	if err != nil {
+		return stats, err
+	}
+	stats.PendingAcks = b.pendingAckCount(queue)
+	return stats, nil
 }
 
 // Store returns the underlying storage interface. Exposed so the public Queue
@@ -799,20 +927,43 @@ func (b *Broker) Resume(queue string) {
 }
 
 // Drain processes all remaining messages on the given queue to quiescence
-// (empty Dequeue + zero in-flight workers), then stops that queue's
-// dispatcher. It blocks until the drain completes or ctx expires.
+// (empty Dequeue + zero in-flight workers + no unsettled acknowledgements),
+// then stops that queue's dispatcher. It blocks until the drain completes or
+// ctx expires.
 //
 // Unlike Shutdown, Drain only affects a single queue — other queues keep
 // running. After Drain returns, the queue's dispatcher has exited; Pause +
 // Resume can restart it (Resume re-registers if needed).
+//
+// If acknowledgements for the queue cannot be durably confirmed, Drain does
+// not report success: it keeps the buffer for the retry loop and returns an
+// error wrapping ErrUnsettledAcks once ctx expires. If ctx is cancelled while
+// unsettled acks remain, the returned error matches both ErrUnsettledAcks and
+// ctx.Err() via errors.Is.
 func (b *Broker) Drain(ctx context.Context, queue string) error {
-	// Check if the queue has a running dispatcher. If not, nothing to drain.
+	// Check if the queue has a handler. If not, there is nothing to drain.
 	b.hMu.RLock()
 	_, hasHandler := b.handlers[queue]
 	b.hMu.RUnlock()
 	if !hasHandler {
 		return nil
 	}
+	// A closed broker has no store to flush against and no dispatcher to
+	// signal done; refuse rather than block on a channel nobody will close.
+	if b.closed.Load() {
+		return fmt.Errorf("shoebox: drain %q: %w", queue, errAlreadyClosed)
+	}
+
+	// Restart the dispatcher if it has already exited (e.g. after a previous
+	// Drain or a force-abort). Without a live dispatcher the done channel below
+	// would never close, so a repeated Drain could never make progress.
+	b.hMu.Lock()
+	if !b.dispatching[queue] {
+		b.dispatching[queue] = true
+		b.wg.Add(1)
+		go b.dispatch(queue)
+	}
+	b.hMu.Unlock()
 
 	// Set up the per-queue drain flag and a fresh done channel.
 	// The done channel is created (or replaced) under the lock so that
@@ -831,22 +982,26 @@ func (b *Broker) Drain(ctx context.Context, queue string) error {
 	b.qDrainingMu.Unlock()
 
 	// Signal the dispatcher to wake up and notice the drain flag.
-	b.hMu.RLock()
-	wake, ok := b.dispatchC[queue]
-	b.hMu.RUnlock()
-	if ok {
-		select {
-		case wake <- struct{}{}:
-		default:
-		}
-	}
+	b.wake(queue)
 
 	select {
 	case <-done:
 	case <-ctx.Done():
 		// Clean up: clear the flag so the dispatcher doesn't exit later.
 		flag.Store(false)
-		return ctx.Err()
+		// The dispatcher only signals done when there were no unsettled acks;
+		// reaching the deadline with a non-empty buffer means confirmations are
+		// still unwritten, so report both the cancellation and that fact.
+		if b.pendingAckCount(queue) > 0 {
+			return errors.Join(ctx.Err(), ErrUnsettledAcks)
+		}
+		return fmt.Errorf("shoebox: drain %q: %w", queue, ctx.Err())
+	}
+
+	// Defensive: the dispatcher claims quiescence and no unsettled acks. If a
+	// residual buffer remains, refuse to report success.
+	if b.pendingAckCount(queue) > 0 {
+		return fmt.Errorf("shoebox: drain %q: %w", queue, ErrUnsettledAcks)
 	}
 
 	// Cleanup: purge dedupe entries for this queue to free memory.
@@ -893,6 +1048,9 @@ func (b *Broker) signalDrainDone(queue string) {
 	b.qDrainingMu.Lock()
 	defer b.qDrainingMu.Unlock()
 	if ch, ok := b.drainDone[queue]; ok {
+		// Delete before closing so a second (stale) dispatcher signalling after
+		// a fresh Drain installed a new channel cannot double-close it panic.
+		delete(b.drainDone, queue)
 		close(ch)
 	}
 }

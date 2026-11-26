@@ -17,6 +17,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// ErrUnsettledAcks reports that one or more successful handler outcomes could
+// not yet be durably confirmed. With acknowledgement batching enabled, the
+// broker retains those acknowledgements and retries them per queue; Drain and
+// Shutdown return this error (wrapped) rather than claiming success while the
+// confirmations remain unwritten. Use errors.Is to test for it.
+var ErrUnsettledAcks = broker.ErrUnsettledAcks
+
 // Queue is the public-facing message queue. It is safe for concurrent use.
 type Queue struct {
 	b        *broker.Broker
@@ -208,6 +215,11 @@ func asBrokerMiddleware(mw []Middleware) []broker.Middleware {
 // Shutdown stops accepting new enqueues and waits for in-flight handlers to
 // complete or for ctx to expire, whichever comes first.
 //
+// Pending acknowledgements are flushed before Shutdown returns. If a
+// confirmation write cannot be committed, the returned error wraps
+// ErrUnsettledAcks; the buffer is retained and retried until the best-effort
+// final flush or the store closes.
+//
 // After Shutdown returns, the Queue is unusable. Build a new one with New.
 func (q *Queue) Shutdown(ctx context.Context) error {
 	return q.b.Shutdown(ctx)
@@ -221,7 +233,9 @@ func (q *Queue) Healthy() bool {
 
 // Stats returns counters for the named queue. The returned QueueStats is a
 // snapshot; depth is read live, the other fields are cumulative since the
-// Queue was created.
+// Queue was created. When acknowledgement batching is enabled, PendingAcks
+// reports how many successful acks are still buffered and not yet durably
+// confirmed.
 func (q *Queue) Stats(ctx context.Context, queue string) (QueueStats, error) {
 	return q.b.Stats(ctx, queue)
 }
@@ -339,11 +353,15 @@ func (q *Queue) Resume(queue string) {
 }
 
 // Drain processes all remaining messages on the named queue to quiescence
-// (empty Dequeue + zero in-flight workers), then stops that queue's
-// dispatcher. It blocks until drain completes or ctx expires.
+// (empty Dequeue + zero in-flight workers + no unsettled acknowledgements),
+// then stops that queue's dispatcher. It blocks until drain completes or ctx
+// expires.
 //
 // Unlike Shutdown, Drain only affects a single queue — other queues keep
-// running.
+// running. If the queue's acknowledgements cannot be durably confirmed, Drain
+// does not report success: it returns an error wrapping ErrUnsettledAcks. A
+// cancelled wait while acks remain unwritten returns an error matching both
+// ErrUnsettledAcks and ctx.Err().
 func (q *Queue) Drain(ctx context.Context, queue string) error {
 	return q.b.Drain(ctx, queue)
 }
